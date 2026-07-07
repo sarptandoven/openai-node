@@ -1,4 +1,5 @@
-import { zodResponseFormat, zodTextFormat } from 'openai/helpers/zod';
+import { zodRealtimeFunction, zodResponseFormat, zodTextFormat } from 'openai/helpers/zod';
+import type { RealtimeFunctionTool } from 'openai/resources/realtime/realtime';
 import { z as zv3 } from 'zod/v3';
 import { z as zv4 } from 'zod/v4';
 
@@ -141,6 +142,45 @@ describe.each([
       expect(definitionName).toBeDefined();
       expect(definitions).toHaveProperty(definitionName as string);
     }
+  });
+
+  it('creates a Realtime function tool schema', () => {
+    const tool = zodRealtimeFunction({
+      name: 'lookup_weather',
+      description: 'Look up weather by city',
+      parameters: z.object({
+        city: z.string(),
+        units: z.enum(['c', 'f']),
+      }),
+    });
+
+    const realtimeTool: RealtimeFunctionTool = tool;
+
+    expect(realtimeTool).toBe(tool);
+    expect(tool).toMatchObject({
+      type: 'function',
+      name: 'lookup_weather',
+      description: 'Look up weather by city',
+      parameters: {
+        type: 'object',
+        properties: {
+          city: { type: 'string' },
+          units: { type: 'string', enum: ['c', 'f'] },
+        },
+        required: ['city', 'units'],
+        additionalProperties: false,
+      },
+    });
+    expect(tool).not.toHaveProperty('strict');
+  });
+
+  it('omits Realtime tool description when not provided', () => {
+    const tool = zodRealtimeFunction({
+      name: 'lookup_weather',
+      parameters: z.object({ city: z.string() }),
+    });
+
+    expect(tool).not.toHaveProperty('description');
   });
 
   it('automatically adds optional properties to `required`', () => {

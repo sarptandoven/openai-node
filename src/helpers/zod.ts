@@ -12,6 +12,7 @@ import {
 import { zodToJsonSchema as _zodToJsonSchema } from '../_vendor/zod-to-json-schema';
 import { AutoParseableResponseTool, makeParseableResponseTool } from '../lib/ResponsesParser';
 import { type ResponseFormatTextJSONSchemaConfig } from '../resources/responses/responses';
+import { type RealtimeFunctionTool } from '../resources/realtime/realtime';
 import { toStrictJsonSchema } from '../lib/transform';
 import { JSONSchema } from '../lib/jsonschema';
 
@@ -165,6 +166,22 @@ export function zodFunction<Parameters extends z3.ZodType | z4.ZodType>(options:
       parser: (args) => options.parameters.parse(JSON.parse(args)),
     },
   );
+}
+
+export function zodRealtimeFunction<Parameters extends z3.ZodType | z4.ZodType>(options: {
+  name: string;
+  parameters: Parameters;
+  description?: string | undefined;
+}): RealtimeFunctionTool {
+  return {
+    type: 'function',
+    name: options.name,
+    parameters:
+      isZodV4(options.parameters) ?
+        zodV4ToJsonSchema(options.parameters)
+      : zodV3ToJsonSchema(options.parameters, { name: options.name }),
+    ...(options.description ? { description: options.description } : undefined),
+  };
 }
 
 export function zodResponsesFunction<Parameters extends z3.ZodType | z4.ZodType>(options: {
