@@ -10,6 +10,7 @@ import {
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
+import { spawnBashWithCommands } from './utils/bash';
 
 const root = process.cwd();
 const workflow = readFileSync(path.join(root, '.github/workflows/create-releases.yml'), 'utf-8')
@@ -102,6 +103,7 @@ describe('release commit CI gate', () => {
     const releaseSHA = 'a'.repeat(40);
     const repository = 'openai/test-sdk';
     const invocations = path.join(fixture, 'gh.jsonl');
+    const sleepInvocations = path.join(fixture, 'sleep.log');
     const selectedRun = { id: 42, event: 'push', head_sha: releaseSHA, head_branch: 'main' };
 
     try {
@@ -144,10 +146,13 @@ if (args[0] === 'api') {
       // The release-gate fixture must not depend on an undeclared host jq binary.
       writeExecutable(path.join(fixture, 'jq'), 'process.exit(91);');
       // Keep the missing-run polling path deterministic and fast.
-      writeExecutable(path.join(fixture, 'sleep'), 'process.exit(0);');
+      writeExecutable(
+        path.join(fixture, 'sleep'),
+        "require('node:fs').appendFileSync(process.env.SLEEP_INVOCATIONS, process.argv.slice(2).join(' ') + '\\n');",
+      );
 
-      const result = spawnSync(
-        'bash',
+      const result = spawnBashWithCommands(
+        [fixture, path.dirname(process.execPath)],
         [
           '-e',
           '-o',
@@ -165,6 +170,7 @@ if (args[0] === 'api') {
             RELEASE_SHA: releaseSHA,
             GH_TOKEN: 'synthetic-github-token',
             GATE_INVOCATIONS: invocations,
+            SLEEP_INVOCATIONS: sleepInvocations,
             GATE_FIXTURE: JSON.stringify({
               ...scenario,
               runSHA: scenario.mismatch ? 'b'.repeat(40) : releaseSHA,
@@ -189,6 +195,12 @@ if (args[0] === 'api') {
         .split('\n')
         .map((line) => JSON.parse(line));
       const watchCalls = calls.filter((args) => args[0] === 'run');
+      // Polling must use the fixture's sleep, not one that a Bash launcher puts first. The workflow
+      // polls 30 times and sleeps 2 seconds after each attempt that finds no run.
+      const sleepCalls = existsSync(sleepInvocations)
+        ? readFileSync(sleepInvocations, 'utf-8').trim().split('\n')
+        : [];
+      expect(sleepCalls).toEqual(scenario.missing ? Array.from({ length: 30 }, () => '2') : []);
       expect(watchCalls).toEqual(
         scenario.watchExit === undefined
           ? []

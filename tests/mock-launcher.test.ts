@@ -11,6 +11,7 @@ import fs, {
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { vi } from 'vitest';
+import { spawnBashWithCommands } from './utils/bash';
 
 const root = process.cwd();
 const steadyArguments = [
@@ -99,6 +100,7 @@ describe('Steady mock launcher', () => {
     const executableDirectory = path.join(fixture, 'executables');
     const observationsFile = path.join(fixture, 'steady.jsonl');
     const pnpmInvocation = path.join(fixture, 'pnpm-invoked');
+    const curlInvocations = path.join(fixture, 'curl-invocations');
     const steadyPidFile = path.join(fixture, 'steady.pid');
     const url = 'fixtures/spec with spaces; $(touch shell-injection).yml';
     let steadyPid: number | undefined;
@@ -138,14 +140,15 @@ describe('Steady mock launcher', () => {
         path.join(executableDirectory, 'curl'),
         [
           "const fs = require('node:fs');",
+          "fs.appendFileSync(process.env.CURL_INVOCATIONS, 'curl\\n');",
           "const observations = fs.existsSync(process.env.STEADY_OBSERVATIONS) ? fs.readFileSync(process.env.STEADY_OBSERVATIONS, 'utf8').trim().split('\\n') : [];",
           "const daemonStarted = observations.some((line) => JSON.parse(line).args[0] !== '--version');",
           'process.exit(daemonStarted && fs.existsSync(process.env.STEADY_PID_FILE) ? 0 : 1);',
         ].join('\n'),
       );
 
-      const result = spawnSync(
-        'bash',
+      const result = spawnBashWithCommands(
+        [executableDirectory, path.dirname(process.execPath)],
         [path.join(checkout, 'scripts/mock'), url, ...(daemon ? ['--daemon'] : [])],
         {
           cwd: fixture,
@@ -157,6 +160,7 @@ describe('Steady mock launcher', () => {
             STEADY_OBSERVATIONS: observationsFile,
             STEADY_PID_FILE: steadyPidFile,
             PNPM_INVOCATION: pnpmInvocation,
+            CURL_INVOCATIONS: curlInvocations,
           },
           timeout: 5000,
         },
@@ -181,6 +185,8 @@ describe('Steady mock launcher', () => {
       expect(observations).toEqual(
         daemon ? [{ args: ['--version'], cwd, node: process.version }, expected] : [expected],
       );
+      // The health check must use the fixture's curl, not one that a Bash launcher puts first.
+      expect(existsSync(curlInvocations)).toBe(daemon);
       if (daemon) {
         expect(result.stdout).toContain('Waiting for server');
         expect(steadyPid).toBeDefined();
@@ -201,6 +207,7 @@ describe('Steady mock launcher', () => {
     const fixture = mkdtempSync(path.join(tmpdir(), 'openai-node-mock-launcher-exit-'));
     const checkout = path.join(fixture, 'checkout');
     const executableDirectory = path.join(fixture, 'executables');
+    const curlInvocations = path.join(fixture, 'curl-invocations');
 
     try {
       mkdirSync(path.join(checkout, 'scripts'), { recursive: true });
@@ -216,21 +223,30 @@ fi
 echo "synthetic startup failure" >&2
 exit 23`,
       );
-      writeShellExecutable(path.join(executableDirectory, 'curl'), 'exit 1');
+      writeShellExecutable(
+        path.join(executableDirectory, 'curl'),
+        'echo curl >> "$CURL_INVOCATIONS"\nexit 1',
+      );
 
-      const result = spawnSync('bash', [path.join(checkout, 'scripts/mock'), 'synthetic.yml', '--daemon'], {
-        cwd: fixture,
-        encoding: 'utf-8',
-        env: {
-          ...process.env,
-          PATH: `${executableDirectory}${path.delimiter}${path.dirname(process.execPath)}${path.delimiter}${process.env['PATH']}`,
+      const result = spawnBashWithCommands(
+        [executableDirectory, path.dirname(process.execPath)],
+        [path.join(checkout, 'scripts/mock'), 'synthetic.yml', '--daemon'],
+        {
+          cwd: fixture,
+          encoding: 'utf-8',
+          env: {
+            ...process.env,
+            PATH: `${executableDirectory}${path.delimiter}${path.dirname(process.execPath)}${path.delimiter}${process.env['PATH']}`,
+            CURL_INVOCATIONS: curlInvocations,
+          },
+          timeout: 5000,
         },
-        timeout: 5000,
-      });
+      );
 
       expect(result.error).toBeUndefined();
       expect(result.status).toBe(1);
       expect(result.stdout).toContain('synthetic startup failure');
+      expect(existsSync(curlInvocations)).toBe(true);
     } finally {
       rmSync(fixture, { recursive: true, force: true });
     }

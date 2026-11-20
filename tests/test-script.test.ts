@@ -10,9 +10,9 @@ import {
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { spawnSync } from 'node:child_process';
 
 import jestConfig from '../jest.config';
+import { spawnBashWithCommands, toBashPath } from './utils/bash';
 import generatedTestPatterns from '../scripts/generated-test-patterns.json';
 
 const testScriptPath = path.join(process.cwd(), 'scripts/test');
@@ -20,16 +20,6 @@ const generatedTestPatternsPath = path.join(process.cwd(), 'scripts/generated-te
 const generatedTopLevelTests = generatedTestPatterns
   .filter((pattern) => pattern.endsWith('.test.ts'))
   .map((pattern) => path.basename(pattern));
-
-function toBashPath(path: string): string {
-  if (process.platform !== 'win32') {
-    return path;
-  }
-  return path
-    .replace(/^[A-Za-z]:[\\/]/u, (prefix) => `/${prefix.charAt(0).toLowerCase()}/`)
-    .split('\\')
-    .join('/');
-}
 
 function toBashArgument(arg: string): string {
   if (process.platform !== 'win32' || !/^[A-Za-z]:[\\/]/u.test(arg)) {
@@ -84,16 +74,9 @@ printf '%s\\0' "$@" > "$VITEST_ARGS_FILE"
   function runTestScript(args: string[], suite = 'all') {
     const jestArgsFile = path.join(fixtureDir, 'jest-args');
     const vitestArgsFile = path.join(fixtureDir, 'vitest-args');
-    const result = spawnSync(
-      'bash',
-      [
-        '-c',
-        'PATH="$1:$PATH"; shift; exec "$@"',
-        'bash',
-        toBashPath(path.join(fixtureDir, 'bin')),
-        toBashPath(path.join(fixtureDir, 'scripts/test')),
-        ...args.map(toBashArgument),
-      ],
+    const result = spawnBashWithCommands(
+      [path.join(fixtureDir, 'bin')],
+      [toBashPath(path.join(fixtureDir, 'scripts/test')), ...args.map(toBashArgument)],
       {
         encoding: 'utf-8',
         env: {
