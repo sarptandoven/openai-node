@@ -101,6 +101,8 @@ export class Stream<Item> implements AsyncIterable<Item> {
    *
    * The resulting stream can be consumed only once, ignores events after `[DONE]`, and
    * surfaces API error payloads as `APIError` instances in the default `legacy` mode.
+   * Iteration finishes at `[DONE]`. The unread rest of the response is canceled up to one
+   * second later, so that its connection can be reused.
    * In `events` mode, every parsed JSON payload remains a stream item. When
    * `synthesizeEventData` is enabled, each item also includes its SSE event name.
    * Custom factories that wrap this method should forward the optional fifth
@@ -123,7 +125,7 @@ export class Stream<Item> implements AsyncIterable<Item> {
       consumed = true;
       let done = false;
       let receivedCompletionSentinel = false;
-      const messages = _iterSSEMessages(response, controller);
+      const messages = _iterSSEMessages(response, controller, () => receivedCompletionSentinel);
       const closeMessages = messages.return.bind(messages);
       messages.return = (value) => {
         // Abort before nested iterator cleanup can wait on the response body's cancellation.
@@ -405,7 +407,18 @@ export class Stream<Item> implements AsyncIterable<Item> {
   }
 }
 
-function createAbortableSSESource(body: NonNullable<Response['body']>, signal: AbortSignal) {
+// Canceling a response before its end arrives makes fetch discard a keep-alive connection. A server
+// normally ends its response moments after `[DONE]`, and fetch pools the connection once the response
+// ends, whether or not its body is read. So a completed response is left unread and canceled after
+// this delay, or as soon as its request is aborted. This also bounds how long a server or proxy that
+// keeps the response open after `[DONE]` can hold the connection.
+const COMPLETED_RESPONSE_CANCEL_DELAY_MS = 1000;
+
+function createAbortableSSESource(
+  body: NonNullable<Response['body']>,
+  signal: AbortSignal,
+  isComplete: () => boolean,
+) {
   const reader = typeof body.getReader === 'function' ? body.getReader() : undefined;
   const source = reader
     ? {
@@ -444,6 +457,36 @@ function createAbortableSSESource(body: NonNullable<Response['body']>, signal: A
       cancel();
     });
   };
+  // Bodies without a reader are still canceled immediately.
+  const canDeferCancel = () =>
+    reader !== undefined && !closed && !canceled && !signal.aborted && isComplete();
+  // The caller's iteration has already finished at `[DONE]`. This never aborts the request: helpers
+  // report an aborted controller after completion as a user abort.
+  const cancelLater = () => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const release = () => {
+      clearTimeout(timer);
+      signal.removeEventListener('abort', release);
+      cancel();
+      try {
+        reader?.releaseLock();
+      } catch {
+        // Nothing awaits this release, so there is no caller to report a failure to.
+      }
+    };
+    timer = setTimeout(release, COMPLETED_RESPONSE_CANCEL_DELAY_MS);
+    const handle: unknown = timer;
+    if (
+      typeof handle === 'object' &&
+      handle !== null &&
+      'unref' in handle &&
+      typeof handle.unref === 'function'
+    ) {
+      handle.unref();
+    }
+    signal.removeEventListener('abort', abort);
+    signal.addEventListener('abort', release, { once: true });
+  };
   const iterator: AsyncIterableIterator<Bytes> = {
     async next() {
       if (signal.aborted) {
@@ -470,6 +513,10 @@ function createAbortableSSESource(body: NonNullable<Response['body']>, signal: A
       }
     },
     async return() {
+      if (canDeferCancel()) {
+        // `cleanup()` releases a completed response.
+        return ended;
+      }
       const pending = cancel();
       if (pending && !signal.aborted) {
         const aborted = waitForAbort();
@@ -497,6 +544,10 @@ function createAbortableSSESource(body: NonNullable<Response['body']>, signal: A
       }
     },
     async cleanup(failed: boolean) {
+      if (!failed && canDeferCancel()) {
+        cancelLater();
+        return;
+      }
       let cleanupError: unknown;
       try {
         signal.removeEventListener('abort', abort);
@@ -530,12 +581,16 @@ function createAbortableSSESource(body: NonNullable<Response['body']>, signal: A
 /**
  * Decodes complete SSE records from a response and aborts when its body is absent.
  * Complete events are decoded on demand without imposing a line or event size limit.
+ * Closing the generator cancels the unread body. When `isComplete` reports that the caller
+ * received the protocol's completion event, the body is canceled after a short delay instead,
+ * so that the server's end of the response can arrive and the connection can be reused.
  *
  * @yields {ServerSentEvent} Each decoded server-sent event in wire order.
  */
 export async function* _iterSSEMessages(
   response: Response,
   controller: AbortController,
+  isComplete: () => boolean = () => false,
 ): AsyncGenerator<ServerSentEvent, void, unknown> {
   if (!response.body) {
     controller.abort();
@@ -554,7 +609,7 @@ export async function* _iterSSEMessages(
   const sseDecoder = new SSEDecoder();
   const lineDecoder = new LineDecoder();
   const { signal } = controller;
-  const source = createAbortableSSESource(response.body, signal);
+  const source = createAbortableSSESource(response.body, signal, isComplete);
   let failed = false;
 
   try {

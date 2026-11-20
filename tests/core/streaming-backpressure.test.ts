@@ -24,7 +24,10 @@ function packedBody(prefix: string) {
   return { body, cancel };
 }
 
-afterEach(() => vi.restoreAllMocks());
+afterEach(() => {
+  vi.useRealTimers();
+  vi.restoreAllMocks();
+});
 
 test('does not decode packed SSE records ahead of the consumer', async () => {
   const first = 'data: {"type":"response.output_text.delta","delta":"hello"}\n\n';
@@ -52,6 +55,7 @@ test('does not decode packed SSE records ahead of the consumer', async () => {
 });
 
 test('does not decode the packed tail after the completion sentinel', async () => {
+  vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
   const first = 'data: {"id":1}\n\n';
   const done = 'data: [DONE]\n\n';
   const { body, cancel } = packedBody(first + done);
@@ -69,6 +73,9 @@ test('does not decode the packed tail after the completion sentinel', async () =
     await iterator.return?.();
   }
 
+  // A completed response is canceled after a delay so that its connection can be reused.
+  expect(cancel).not.toHaveBeenCalled();
+  await vi.advanceTimersByTimeAsync(1000);
   expect(cancel).toHaveBeenCalledTimes(1);
   expect(body.locked).toBe(false);
   expect(controller.signal.aborted).toBe(false);

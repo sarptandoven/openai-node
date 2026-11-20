@@ -33,6 +33,10 @@ function settlesSoon<T>(promise: Promise<T>): Promise<T> {
 }
 
 describe('public Responses SSE iterator early exit', () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
   const event = responseEvent;
   const wire = `data: ${JSON.stringify(event)}\n\n`;
 
@@ -109,6 +113,7 @@ describe('public Responses SSE iterator early exit', () => {
   test.each([false, true])(
     'returning an unused iterator preserves the owner (started: %s)',
     async (started) => {
+      vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
       const cancel = vi.fn();
       const body = new ReadableStream<Uint8Array>({
         start(source) {
@@ -131,11 +136,14 @@ describe('public Responses SSE iterator early exit', () => {
       }
       await expect(owner.next()).resolves.toEqual({ done: true, value: undefined });
       expect(stream.controller.signal.aborted).toBe(false);
+      // A completed response is canceled after a delay so that its connection can be reused.
+      await vi.advanceTimersByTimeAsync(1000);
       expect(body.locked).toBe(false);
     },
   );
 
   test.each(['EOF', '[DONE]'])('return after %s does not abort a completed stream', async (ending) => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
     const cancel = vi.fn();
     const body = new ReadableStream<Uint8Array>({
       start(source) {
@@ -152,6 +160,7 @@ describe('public Responses SSE iterator early exit', () => {
     await expect(iterator.next()).resolves.toEqual({ done: true, value: undefined });
     await expect(iterator.return?.()).resolves.toEqual({ done: true, value: undefined });
     expect(stream.controller.signal.aborted).toBe(false);
+    await vi.advanceTimersByTimeAsync(1000);
     expect(body.locked).toBe(false);
     expect(cancel).toHaveBeenCalledTimes(ending === 'EOF' ? 0 : 1);
   });

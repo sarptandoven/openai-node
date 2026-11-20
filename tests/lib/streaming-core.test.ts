@@ -1,3 +1,5 @@
+import { PassThrough } from 'node:stream';
+import { setTimeout as setTimeoutPromise } from 'node:timers/promises';
 import { vi } from 'vitest';
 import OpenAI from 'openai';
 import { APIError, APIUserAbortError, OpenAIError } from 'openai/core/error';
@@ -163,56 +165,192 @@ describe('Stream.fromSSEResponse', () => {
     },
   );
 
-  test('finishes at the completion sentinel without waiting for the response body to close', async () => {
-    const cancel = vi.fn();
-    const body = new ReadableStream<Uint8Array>(
-      {
-        start(controller) {
-          controller.enqueue(encoder.encode('data: {"id":1}\n\ndata: [DONE]\n\n'));
+  describe('after the completion sentinel', () => {
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    function completedBody(cancel: (reason: unknown) => void | PromiseLike<void> = () => {}) {
+      let open!: ReadableStreamDefaultController<Uint8Array>;
+      const pull = vi.fn(() => {
+        throw new Error('Attempted to read past the [DONE] completion sentinel');
+      });
+      const body = new ReadableStream<Uint8Array>(
+        {
+          start(controller) {
+            open = controller;
+            controller.enqueue(encoder.encode('data: {"id":1}\n\ndata: [DONE]\n\n'));
+          },
+          pull,
+          cancel,
         },
-        pull() {
-          throw new Error('Attempted to read past the [DONE] completion sentinel');
-        },
-        cancel,
+        { highWaterMark: 0 },
+      );
+      return { body, pull, open: () => open };
+    }
+
+    async function finish(body: ReadableStream<Uint8Array>, controller: AbortController) {
+      const iterator = Stream.fromSSEResponse<{ id: number }>(new Response(body), controller)[
+        Symbol.asyncIterator
+      ]();
+      await expect(iterator.next()).resolves.toEqual({ value: { id: 1 }, done: false });
+      await expect(iterator.next()).resolves.toEqual({ value: undefined, done: true });
+    }
+
+    test.each([false, true])(
+      'cancels the unread response after a delay (cancellation rejects: %s)',
+      async (rejects) => {
+        vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+        const cancel = rejects
+          ? vi.fn().mockRejectedValue(new Error('Response body cancellation failed'))
+          : vi.fn();
+        const { body, pull } = completedBody(cancel);
+        const controller = new AbortController();
+
+        await finish(body, controller);
+        // Leaving the body open lets the server's end of the response return the connection to the pool.
+        await vi.advanceTimersByTimeAsync(999);
+        expect(cancel).not.toHaveBeenCalled();
+        expect(body.locked).toBe(true);
+
+        await vi.advanceTimersByTimeAsync(1);
+        expect(cancel).toHaveBeenCalledTimes(1);
+        expect(body.locked).toBe(false);
+        expect(pull).not.toHaveBeenCalled();
+        // Helpers treat an aborted controller after completion as a user abort.
+        expect(controller.signal.aborted).toBe(false);
       },
-      { highWaterMark: 0 },
     );
-    const controller = new AbortController();
-    const iterator = Stream.fromSSEResponse<{ id: number }>(new Response(body), controller)[
-      Symbol.asyncIterator
-    ]();
 
-    await expect(iterator.next()).resolves.toEqual({ value: { id: 1 }, done: false });
-    await expect(iterator.next()).resolves.toEqual({ value: undefined, done: true });
-    expect(cancel).toHaveBeenCalledTimes(1);
-    expect(body.locked).toBe(false);
-    expect(controller.signal.aborted).toBe(false);
-  });
+    test('cancels the unread response as soon as its request is aborted', async () => {
+      vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+      const cancel = vi.fn();
+      const { body, pull } = completedBody(cancel);
+      const controller = new AbortController();
 
-  test('finishes at the completion sentinel and aborts when response cancellation rejects', async () => {
-    const cancel = vi.fn().mockRejectedValue(new Error('Response body cancellation failed'));
-    const body = new ReadableStream<Uint8Array>(
-      {
-        start(controller) {
-          controller.enqueue(encoder.encode('data: {"id":1}\n\ndata: [DONE]\n\n'));
+      await finish(body, controller);
+      controller.abort();
+
+      expect(cancel).toHaveBeenCalledTimes(1);
+      expect(body.locked).toBe(false);
+      expect(pull).not.toHaveBeenCalled();
+      expect(vi.getTimerCount()).toBe(0);
+    });
+
+    test('releases a response that ends on its own without canceling it', async () => {
+      vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+      const cancel = vi.fn();
+      const { body, open } = completedBody(cancel);
+      const controller = new AbortController();
+
+      await finish(body, controller);
+      open().close();
+      await vi.advanceTimersByTimeAsync(1000);
+
+      expect(cancel).not.toHaveBeenCalled();
+      expect(body.locked).toBe(false);
+      expect(controller.signal.aborted).toBe(false);
+    });
+
+    test('lets a helper finish when canceling the open response fails', async () => {
+      vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+      const cancel = vi.fn().mockRejectedValue(new Error('Response body cancellation failed'));
+      const chunk = (content: string, finishReason: 'stop' | null) =>
+        `data: ${JSON.stringify({
+          id: 'chatcmpl_synthetic',
+          object: 'chat.completion.chunk',
+          created: 0,
+          model: 'gpt-synthetic',
+          choices: [{ index: 0, delta: { role: 'assistant', content }, finish_reason: finishReason }],
+        })}\n\n`;
+      const body = new ReadableStream<Uint8Array>(
+        {
+          start(controller) {
+            controller.enqueue(encoder.encode(`${chunk('Hi', null)}${chunk('', 'stop')}data: [DONE]\n\n`));
+          },
+          cancel,
         },
-        pull() {
-          throw new Error('Attempted to read past the [DONE] completion sentinel');
-        },
-        cancel,
+        { highWaterMark: 0 },
+      );
+      const client = new OpenAI({
+        apiKey: 'sk-synthetic-helper',
+        maxRetries: 0,
+        fetch: async () => new Response(body, { headers: { 'content-type': 'text/event-stream' } }),
+      });
+
+      const completion = client.chat.completions
+        .stream({ model: 'gpt-synthetic', messages: [{ role: 'user', content: 'hello' }] })
+        .finalChatCompletion();
+      // Helpers start their request from a zero-delay timer.
+      await vi.advanceTimersByTimeAsync(0);
+      await expect(completion).resolves.toMatchObject({ choices: [{ message: { content: 'Hi' } }] });
+      expect(cancel).not.toHaveBeenCalled();
+
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(cancel).toHaveBeenCalledTimes(1);
+      expect(body.locked).toBe(false);
+    });
+
+    test.each(['synchronously', 'after a microtask', 'after the delay'])(
+      'cancels a Node stream body %s without an uncaught error when its source then ends',
+      async (timing) => {
+        const uncaught = vi.fn();
+        process.on('uncaughtException', uncaught);
+        try {
+          if (timing === 'after the delay') {
+            vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+          }
+          const source = new PassThrough();
+          source.write('data: {"id":1}\n\ndata: [DONE]\n\n');
+          const response = new Response(source);
+          const controller = new AbortController();
+
+          await expect(collect(Stream.fromSSEResponse(response, controller))).resolves.toEqual([{ id: 1 }]);
+          if (timing === 'after the delay') {
+            await vi.advanceTimersByTimeAsync(1000);
+          } else {
+            if (timing === 'after a microtask') {
+              await Promise.resolve();
+            }
+            controller.abort();
+          }
+          expect(response.body?.locked).toBe(false);
+          // Node's fetch closes a body that wraps a stream once that stream ends. Closing a canceled
+          // body that still had a pending read would throw outside of any caller.
+          source.end();
+          await setTimeoutPromise(10);
+          expect(uncaught).not.toHaveBeenCalled();
+        } finally {
+          process.removeListener('uncaughtException', uncaught);
+        }
       },
-      { highWaterMark: 0 },
     );
-    const controller = new AbortController();
-    const iterator = Stream.fromSSEResponse<{ id: number }>(new Response(body), controller)[
-      Symbol.asyncIterator
-    ]();
 
-    await expect(iterator.next()).resolves.toEqual({ value: { id: 1 }, done: false });
-    await expect(iterator.next()).resolves.toEqual({ value: undefined, done: true });
-    expect(cancel).toHaveBeenCalledTimes(1);
-    expect(body.locked).toBe(false);
-    expect(controller.signal.aborted).toBe(true);
+    test('cancels a body without a reader immediately', async () => {
+      const returned = vi.fn(async () => ({ value: undefined, done: true as const }));
+      const source: AsyncIterableIterator<Uint8Array> = {
+        next: vi
+          .fn()
+          .mockResolvedValueOnce({ value: encoder.encode('data: {"id":1}\n\ndata: [DONE]\n\n'), done: false })
+          .mockImplementation(() => Promise.race<IteratorResult<Uint8Array>>([])),
+        return: returned,
+        [Symbol.asyncIterator]() {
+          return this;
+        },
+      };
+      const body = new ReadableStream<Uint8Array>();
+      const response = new Response(body);
+      Object.defineProperties(body, {
+        getReader: { value: undefined },
+        [Symbol.asyncIterator]: { value: () => source },
+      });
+      const controller = new AbortController();
+
+      await expect(collect(Stream.fromSSEResponse(response, controller))).resolves.toEqual([{ id: 1 }]);
+      expect(source.next).toHaveBeenCalledTimes(1);
+      expect(returned).toHaveBeenCalledTimes(1);
+      expect(controller.signal.aborted).toBe(false);
+    });
   });
 
   test('optionally preserves the event name alongside its parsed data', async () => {

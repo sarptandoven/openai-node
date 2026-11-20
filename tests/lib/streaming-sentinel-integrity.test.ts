@@ -215,46 +215,61 @@ describe('SSE completion sentinel integrity', () => {
   });
 
   it('finishes an exact sentinel immediately without waiting for physical response EOF', async () => {
-    const cancel = vi.fn();
-    const body = new ReadableStream<Uint8Array>(
-      {
-        start(controller) {
-          controller.enqueue(encoder.encode(record(JSON.stringify({ id: 'safe' })) + record('[DONE]')));
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    try {
+      const cancel = vi.fn();
+      const body = new ReadableStream<Uint8Array>(
+        {
+          start(controller) {
+            controller.enqueue(encoder.encode(record(JSON.stringify({ id: 'safe' })) + record('[DONE]')));
+          },
+          pull() {
+            throw new Error('The response was read beyond its exact completion sentinel.');
+          },
+          cancel,
         },
-        pull() {
-          throw new Error('The response was read beyond its exact completion sentinel.');
-        },
-        cancel,
-      },
-      { highWaterMark: 0 },
-    );
-    const controller = new AbortController();
-    const stream = Stream.fromSSEResponse(responseFor(body), controller);
+        { highWaterMark: 0 },
+      );
+      const controller = new AbortController();
+      const stream = Stream.fromSSEResponse(responseFor(body), controller);
 
-    await expect(collect(stream)).resolves.toEqual([{ id: 'safe' }]);
-    expect(cancel).toHaveBeenCalledTimes(1);
-    expect(body.locked).toBe(false);
-    expect(controller.signal.aborted).toBe(false);
+      await expect(collect(stream)).resolves.toEqual([{ id: 'safe' }]);
+      expect(cancel).not.toHaveBeenCalled();
+
+      await vi.advanceTimersByTimeAsync(1000);
+      await vi.waitFor(() => expect(body.locked).toBe(false));
+      expect(cancel).toHaveBeenCalledTimes(1);
+      expect(controller.signal.aborted).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('continues suppressing cleanup errors after genuine completion', async () => {
-    const cancel = vi.fn().mockRejectedValue(new Error('response cancellation failed'));
-    const body = new ReadableStream<Uint8Array>(
-      {
-        start(controller) {
-          controller.enqueue(encoder.encode(record('[DONE]')));
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    try {
+      const cancel = vi.fn().mockRejectedValue(new Error('response cancellation failed'));
+      const body = new ReadableStream<Uint8Array>(
+        {
+          start(controller) {
+            controller.enqueue(encoder.encode(record('[DONE]')));
+          },
+          cancel,
         },
-        cancel,
-      },
-      { highWaterMark: 0 },
-    );
-    const controller = new AbortController();
-    const stream = Stream.fromSSEResponse(responseFor(body), controller);
+        { highWaterMark: 0 },
+      );
+      const controller = new AbortController();
+      const stream = Stream.fromSSEResponse(responseFor(body), controller);
 
-    await expect(collect(stream)).resolves.toEqual([]);
-    expect(cancel).toHaveBeenCalledTimes(1);
-    expect(body.locked).toBe(false);
-    expect(controller.signal.aborted).toBe(true);
+      await expect(collect(stream)).resolves.toEqual([]);
+
+      await vi.advanceTimersByTimeAsync(1000);
+      await vi.waitFor(() => expect(body.locked).toBe(false));
+      expect(cancel).toHaveBeenCalledTimes(1);
+      expect(controller.signal.aborted).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('ignores malformed and named provider-error frames after genuine completion', async () => {
