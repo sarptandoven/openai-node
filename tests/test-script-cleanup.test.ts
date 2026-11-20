@@ -57,6 +57,10 @@ describeBash('scripts/test mock-server cleanup', () => {
       TEST_API_BASE_URL: '',
       STARTUP_EXIT: '0',
       PAUSE_STARTUP: 'false',
+      IGNORE_SIGTERM: 'false',
+      RECORD_WINDOWS_PID: 'false',
+      TASKLIST_IMAGE: 'node.exe',
+      TASKKILL_EXIT: '0',
       REUSE_HEALTHY: 'false',
       HEALTH_STATUS: '200',
       JEST_EXIT: '0',
@@ -68,7 +72,8 @@ describeBash('scripts/test mock-server cleanup', () => {
       copyFileSync(path.join(repoRoot, file), path.join(fixture, file));
     }
     writeExecutable('bin/curl', 'bash', '[ "$REUSE_HEALTHY" = true ] || [ -f "$FIXTURE_ROOT/mock.ready" ]');
-    writeExecutable('bin/lsof', 'bash', 'touch "$FIXTURE_ROOT/lsof.called"\ncat "$FIXTURE_ROOT/server.pid"');
+    // Some hosts lack lsof; cleanup must not depend on it.
+    writeExecutable('bin/lsof', 'bash', 'touch "$FIXTURE_ROOT/lsof.called"\nexit 127');
     writeExecutable('node_modules/.bin/jest', 'bash', 'touch "$FIXTURE_ROOT/jest.called"\nexit "$JEST_EXIT"');
     writeExecutable(
       'server.cjs',
@@ -84,7 +89,7 @@ const server = http.createServer((request, response) => {
 });
 process.on('SIGTERM', () => {
   fs.writeFileSync(root + '/server.stopped', 'SIGTERM');
-  server.close(() => process.exit(0));
+  if (process.env.IGNORE_SIGTERM !== 'true') server.close(() => process.exit(0));
 });
 server.listen(0, '127.0.0.1', () => {
   const address = server.address();
@@ -102,6 +107,11 @@ fs.writeFileSync(root + '/mock.called', String(process.pid));
 if (process.env.STARTUP_EXIT !== '0') process.exit(Number(process.env.STARTUP_EXIT));
 const child = spawn(process.execPath, [root + '/server.cjs'], { stdio: ['ignore', 'ignore', 'ignore', 'ipc'] });
 child.once('error', () => process.exit(1));
+const pidFile = process.env.OPENAI_MOCK_PID_FILE;
+if (pidFile) {
+  fs.writeFileSync(root + '/pid-file.path', pidFile);
+  fs.writeFileSync(pidFile, String(child.pid) + (process.env.RECORD_WINDOWS_PID === 'true' ? '\\n' + child.pid : ''));
+}
 child.once('message', () => {
   if (process.env.PAUSE_STARTUP === 'true') { fs.writeFileSync(root + '/startup.paused', ''); return; }
   fs.writeFileSync(root + '/mock.ready', '');
@@ -201,9 +211,117 @@ child.once('message', () => {
 
     expect(existsSync(path.join(fixture, 'mock.called'))).toBe(true);
     expect(existsSync(path.join(fixture, 'jest.called'))).toBe(true);
-    expect(existsSync(path.join(fixture, 'lsof.called'))).toBe(true);
-    await vi.waitFor(() => expect(isRunning(fixturePid())).toBe(false));
+    expect(existsSync(path.join(fixture, 'lsof.called'))).toBe(false);
+    expect(isRunning(fixturePid())).toBe(false);
     expect(readFileSync(path.join(fixture, 'server.stopped'), 'utf-8')).toBe('SIGTERM');
+    expect(existsSync(readFileSync(path.join(fixture, 'pid-file.path'), 'utf-8'))).toBe(false);
+  });
+
+  test('leaves no error when its started mock has already exited', async () => {
+    writeExecutable(
+      'node_modules/.bin/jest',
+      'bash',
+      [
+        'touch "$FIXTURE_ROOT/jest.called"',
+        'server="$(cat "$FIXTURE_ROOT/server.pid")"',
+        'kill "$server"',
+        'while kill -0 "$server" 2>/dev/null; do sleep 0.05; done',
+        'exit "$JEST_EXIT"',
+      ].join('\n'),
+    );
+    env['JEST_EXIT'] = '17';
+
+    runTests(17);
+
+    await vi.waitFor(() => expect(isRunning(fixturePid())).toBe(false));
+    expect(existsSync(readFileSync(path.join(fixture, 'pid-file.path'), 'utf-8'))).toBe(false);
+  });
+
+  describe('with a recorded Windows PID', () => {
+    beforeEach(() => {
+      env['RECORD_WINDOWS_PID'] = 'true';
+      writeExecutable(
+        'bin/tasklist',
+        'bash',
+        [
+          'echo "$*" >> "$FIXTURE_ROOT/tasklist.args"',
+          'pid="$(printf %s "$2" | awk \'{ print $NF }\')"',
+          'if kill -0 "$pid" 2>/dev/null; then',
+          '  printf \'"%s","%s","Console","1","1 K"\\n\' "$TASKLIST_IMAGE" "$pid"',
+          'else',
+          '  echo "INFO: No tasks are running which match the specified criteria."',
+          'fi',
+        ].join('\n'),
+      );
+      writeExecutable(
+        'bin/taskkill',
+        'bash',
+        [
+          'echo "$*" >> "$FIXTURE_ROOT/taskkill.args"',
+          '[ "$TASKKILL_EXIT" = 0 ] || exit "$TASKKILL_EXIT"',
+          'kill "$2"',
+        ].join('\n'),
+      );
+    });
+
+    test('stops the process tree with taskkill', async () => {
+      runTests(0);
+
+      const pid = fixturePid();
+      expect(readFileSync(path.join(fixture, 'tasklist.args'), 'utf-8')).toBe(
+        `/FI PID eq ${pid} /FO CSV /NH\n`,
+      );
+      expect(readFileSync(path.join(fixture, 'taskkill.args'), 'utf-8')).toBe(`/PID ${pid} /T /F\n`);
+      await vi.waitFor(() => expect(isRunning(pid)).toBe(false));
+    });
+
+    test('leaves a reused Windows PID alone', () => {
+      env['TASKLIST_IMAGE'] = 'unrelated.exe';
+
+      runTests(0);
+
+      expect(existsSync(path.join(fixture, 'taskkill.args'))).toBe(false);
+      expect(isRunning(fixturePid())).toBe(true);
+    });
+
+    test('warns without changing the Jest exit when taskkill fails', () => {
+      env['TASKKILL_EXIT'] = '128';
+      env['JEST_EXIT'] = '17';
+      const result = spawnSync('bash', [path.join(fixture, 'scripts/test'), '--showConfig'], {
+        cwd: fixture,
+        env,
+        encoding: 'utf-8',
+        timeout: 10_000,
+      });
+
+      expect(result.error).toBeUndefined();
+      expect(result.status).toBe(17);
+      expect(result.stderr).toContain(
+        `Could not stop the mock server started by this run (Windows PID ${fixturePid()}, taskkill status 128).`,
+      );
+    });
+  });
+
+  test('warns without changing the Jest exit when its started mock does not stop', () => {
+    env['IGNORE_SIGTERM'] = 'true';
+    env['JEST_EXIT'] = '17';
+    try {
+      const result = spawnSync('bash', [path.join(fixture, 'scripts/test'), '--showConfig'], {
+        cwd: fixture,
+        env,
+        encoding: 'utf-8',
+        timeout: 15_000,
+      });
+
+      expect(result.error).toBeUndefined();
+      expect(result.status).toBe(17);
+      expect(result.stderr).toContain(
+        `The mock server started by this run (PID ${fixturePid()}) is still running.`,
+      );
+      expect(isRunning(fixturePid())).toBe(true);
+    } finally {
+      process.kill(fixturePid(), 'SIGKILL');
+    }
   });
 
   test.each([0, 17])('reuses a healthy mock after Jest exit %i', async (exitCode) => {
@@ -242,7 +360,7 @@ child.once('message', () => {
       }
       expect(await closed).toEqual([status, target === 'wrapper' ? 'SIGTERM' : null]);
       await vi.waitFor(() => expect(isRunning(fixturePid())).toBe(false));
-      expect(existsSync(path.join(fixture, 'lsof.called'))).toBe(true);
+      expect(existsSync(path.join(fixture, 'lsof.called'))).toBe(false);
       expect(existsSync(path.join(fixture, 'jest.called'))).toBe(false);
     } finally {
       wrapper.kill('SIGTERM');

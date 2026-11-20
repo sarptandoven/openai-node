@@ -13,12 +13,84 @@ function steady_is_running() {
   curl --silent --fail "http://127.0.0.1:4010/_x-steady/health" >/dev/null 2>&1
 }
 
-kill_server_on_port() {
-  pids=$(lsof -t -i tcp:"$1" || echo "")
-  if [ "$pids" != "" ]; then
-    kill "$pids"
-    echo "Stopped $pids."
+mock_pid_file=""
+
+# Reports whether a process still runs. A stopped server whose parent never reaps it, such as an
+# orphan under a container's init, remains a zombie that `kill -0` would still find.
+mock_is_running() {
+  local stat=""
+  kill -0 "$1" 2>/dev/null || return 1
+  # Linux reports the state after the parenthesized command name, even where ps is not installed.
+  if [ -r "/proc/$1/stat" ]; then
+    stat="$(cat "/proc/$1/stat" 2>/dev/null)" || stat=""
+    stat="${stat##*) }"
+  else
+    stat="$(ps -o stat= -p "$1" 2>/dev/null)" || stat=""
   fi
+  case "$stat" in
+    Z*) return 1 ;;
+  esac
+}
+
+# Runs a Windows command with MSYS argument conversion disabled, so that switches such as /PID reach
+# it unchanged whatever MSYS_NO_PATHCONV or MSYS2_ARG_CONV_EXCL the caller has set.
+windows_command() {
+  MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*' "$@"
+}
+
+# On Windows, node.exe never receives SIGTERM, so the launcher cannot forward it to Deno. Stop the
+# whole native process tree by Windows PID instead. Windows reuses PIDs quickly, so first check that
+# the PID still names a node.exe process.
+stop_started_windows_mock() {
+  local pid="$1" winpid="$2" process status
+  process="$(windows_command tasklist /FI "PID eq $winpid" /FO CSV /NH 2>/dev/null)" || return 0
+  case "$process" in
+    '"node.exe",'* | '"NODE.EXE",'*) ;;
+    *) return 0 ;;
+  esac
+  if windows_command taskkill /PID "$winpid" /T /F >/dev/null 2>&1; then
+    echo "Stopped $pid."
+  else
+    status=$?
+    echo -e "${YELLOW}WARNING:${NC} Could not stop the mock server started by this run (Windows PID $winpid, taskkill status $status)." >&2
+  fi
+}
+
+# Stops the mock server that this run started, using the PIDs its launcher recorded rather than
+# a port lookup tool such as lsof, which some hosts lack.
+stop_started_mock() {
+  local pid="" winpid="" attempt
+  if [ -s "$mock_pid_file" ]; then
+    { read -r pid || true; read -r winpid || true; } < "$mock_pid_file"
+  fi
+  rm -f "$mock_pid_file"
+  # Only a positive PID names one process; `kill 0` would signal this whole process group.
+  case "$pid" in
+    "" | 0* | *[!0-9]*) return ;;
+  esac
+  case "$winpid" in
+    0* | *[!0-9]*) winpid="" ;;
+  esac
+  # A launcher interrupted during startup has not recorded the Windows PID yet. Git Bash can still
+  # map the server's PID to one while the server runs.
+  if [ -z "$winpid" ] && [ -r "/proc/$pid/winpid" ]; then
+    winpid="$(cat "/proc/$pid/winpid" 2>/dev/null)" || winpid=""
+  fi
+  if [ -n "$winpid" ] && command -v taskkill >/dev/null 2>&1; then
+    stop_started_windows_mock "$pid" "$winpid"
+    return
+  fi
+
+  mock_is_running "$pid" || return 0
+  kill "$pid" 2>/dev/null || true
+  for ((attempt = 0; attempt < 50; attempt++)); do
+    if ! mock_is_running "$pid"; then
+      echo "Stopped $pid."
+      return
+    fi
+    sleep 0.1
+  done
+  echo -e "${YELLOW}WARNING:${NC} The mock server started by this run (PID $pid) is still running." >&2
 }
 
 function is_overriding_api_base_url() {
@@ -134,15 +206,17 @@ case "$test_suite" in
 esac
 
 if ! is_overriding_api_base_url && ! steady_is_running ; then
-  # When we exit this script, make sure to kill the background mock server process
-  trap 'kill_server_on_port 4010' EXIT
+  mock_pid_file="$(mktemp "${TMPDIR:-/tmp}/openai-mock-pid.XXXXXX")"
+  # When we exit this script, make sure to stop the mock server it started
+  trap stop_started_mock EXIT
 
   # Start the dev server
-  ./scripts/mock --daemon || {
+  OPENAI_MOCK_PID_FILE="$mock_pid_file" ./scripts/mock --daemon || {
     mock_status=$?
     # The launcher cleans up ordinary startup failures. Signals may skip its trap.
     if [ "$mock_status" -le 128 ]; then
       trap - EXIT
+      rm -f "$mock_pid_file"
     fi
     exit "$mock_status"
   }

@@ -59,6 +59,20 @@ function readPid(filename: string): number | undefined {
   return Number.isSafeInteger(pid) && pid > 0 ? pid : undefined;
 }
 
+// scripts/mock records the daemon's shell PID and, on Git Bash, its Windows PID on a second line.
+function readRecordedPids(filename: string): (number | undefined)[] {
+  if (!existsSync(filename)) {
+    return [];
+  }
+  return readFileSync(filename, 'utf-8')
+    .trim()
+    .split('\n')
+    .map((line) => {
+      const pid = Number(line);
+      return Number.isSafeInteger(pid) && pid > 0 ? pid : undefined;
+    });
+}
+
 async function cleanupFixture(fixture: string, pid: number | undefined) {
   if (pid !== undefined) {
     try {
@@ -100,6 +114,7 @@ describe('Steady mock launcher', () => {
     const observationsFile = path.join(fixture, 'steady.jsonl');
     const pnpmInvocation = path.join(fixture, 'pnpm-invoked');
     const steadyPidFile = path.join(fixture, 'steady.pid');
+    const mockPidFile = path.join(fixture, 'mock.pid');
     const url = 'fixtures/spec with spaces; $(touch shell-injection).yml';
     let steadyPid: number | undefined;
 
@@ -156,6 +171,7 @@ describe('Steady mock launcher', () => {
             STEADY_DAEMON: String(daemon),
             STEADY_OBSERVATIONS: observationsFile,
             STEADY_PID_FILE: steadyPidFile,
+            OPENAI_MOCK_PID_FILE: mockPidFile,
             PNPM_INVOCATION: pnpmInvocation,
           },
           timeout: 5000,
@@ -181,6 +197,17 @@ describe('Steady mock launcher', () => {
       expect(observations).toEqual(
         daemon ? [{ args: ['--version'], cwd, node: process.version }, expected] : [expected],
       );
+      // scripts/test stops exactly the daemon recorded here. Git Bash numbers processes separately
+      // from Windows, so there the recorded Windows PID is the one that matches the daemon.
+      const recorded = readRecordedPids(mockPidFile);
+      if (!daemon) {
+        expect(recorded).toEqual([]);
+      } else if (process.platform === 'win32') {
+        expect(recorded).toHaveLength(2);
+        expect(recorded[1]).toBe(steadyPid);
+      } else {
+        expect(recorded).toEqual([steadyPid]);
+      }
       if (daemon) {
         expect(result.stdout).toContain('Waiting for server');
         expect(steadyPid).toBeDefined();
@@ -241,6 +268,7 @@ exit 23`,
     const checkout = path.join(fixture, 'checkout');
     const bashEnvironment = path.join(fixture, 'bash-env');
     const steadyPidFile = path.join(fixture, 'steady.pid');
+    const mockPidFile = path.join(fixture, 'mock.pid');
     let steadyPid: number | undefined;
 
     try {
@@ -291,6 +319,7 @@ sleep() {
           ...process.env,
           BASH_ENV: bashEnvironment,
           STEADY_PID_FILE: steadyPidFile,
+          OPENAI_MOCK_PID_FILE: mockPidFile,
         },
         timeout: 15_000,
       });
@@ -299,6 +328,11 @@ sleep() {
       expect(result.error).toBeUndefined();
       expect(result.status).toBe(1);
       expect(result.stdout).toContain('Timed out waiting for Steady server to start');
+      // The daemon is recorded before the health wait, so a caller can stop it if startup is interrupted.
+      // No Windows PID is appended after a failed start.
+      expect(readRecordedPids(mockPidFile)).toEqual(
+        process.platform === 'win32' ? [expect.any(Number)] : [steadyPid],
+      );
       expect(steadyPid).toBeDefined();
       if (steadyPid !== undefined) {
         expect(isProcessRunning(steadyPid)).toBe(false);

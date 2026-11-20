@@ -145,23 +145,29 @@ async function run(cache, selected, command, args) {
     }
     throw error;
   } finally {
-    process.off('SIGTERM', onTerm);
-    process.off('SIGINT', onInt);
-    if (!cancelledBeforeSpawn) {
-      await locked(cache, () => {
-        // Start the idle lifetime when the last command finishes using an entry.
-        const now = new Date();
-        for (const name of selected) {
-          const entry = path.join(cache, name);
-          if (fs.existsSync(entry)) {
-            fs.utimesSync(entry, now, now);
+    try {
+      if (!cancelledBeforeSpawn) {
+        await locked(cache, () => {
+          // Start the idle lifetime when the last command finishes using an entry.
+          const now = new Date();
+          for (const name of selected) {
+            const entry = path.join(cache, name);
+            if (fs.existsSync(entry)) {
+              fs.utimesSync(entry, now, now);
+            }
           }
-        }
-        if (fs.existsSync(lease)) {
-          fs.unlinkSync(lease);
-        }
-        prune(cache, selected);
-      });
+          if (fs.existsSync(lease)) {
+            fs.unlinkSync(lease);
+          }
+          prune(cache, selected);
+        });
+      }
+    } finally {
+      // Keep handling signals until cleanup ends. A signal can arrive after the command exits, for
+      // example when a test runner stops this wrapper after Ctrl-C, and must not interrupt cleanup
+      // while it holds the lifecycle lock.
+      process.off('SIGTERM', onTerm);
+      process.off('SIGINT', onInt);
     }
   }
 }

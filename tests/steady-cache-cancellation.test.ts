@@ -12,6 +12,7 @@ import {
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
+import { setTimeout as delay } from 'node:timers/promises';
 import { vi } from 'vitest';
 
 const wrapperPath = path.join(process.cwd(), 'scripts/steady/cache.cjs');
@@ -103,6 +104,42 @@ describe('Steady cache wrapper cancellation', () => {
     expect(readFileSync(path.join(lock, 'owner'), 'utf-8')).toBe('another cache user');
     expect(readdirSync(path.join(cache, '.leases'))).toEqual([]);
   });
+
+  testSignals.each(['SIGINT', 'SIGTERM'] as const)(
+    'finishes its cleanup when %s arrives after the command exits',
+    async (signal) => {
+      const exited = path.join(fixture, 'command-exited');
+      const release = path.join(fixture, 'release-command');
+      const wrapper = startWrapper(
+        `const fs = require('node:fs');
+console.log('CHILD_READY');
+setInterval(() => {
+  if (fs.existsSync(${JSON.stringify(release)})) {
+    fs.writeFileSync(${JSON.stringify(exited)}, '');
+    process.exit(23);
+  }
+}, 10);`,
+      );
+      await vi.waitFor(() => expect(wrapper.output()).toContain('CHILD_READY'), { timeout: 5000 });
+      // Another cache user holds the lock, so the wrapper waits inside its cleanup.
+      const lock = path.join(cache, '.lifecycle-lock');
+      mkdirSync(lock);
+      writeFileSync(release, '');
+      await vi.waitFor(() => expect(existsSync(exited)).toBe(true), { timeout: 5000 });
+      await delay(200);
+
+      // For example, a test runner stopping the wrapper after Ctrl-C already stopped the command.
+      wrapper.child.kill(signal);
+      await delay(200);
+      expect(wrapper.child.exitCode).toBeNull();
+      expect(wrapper.child.signalCode).toBeNull();
+
+      rmSync(lock, { recursive: true });
+      await expect(wrapper.closed).resolves.toEqual([23, null]);
+      expect(readdirSync(path.join(cache, '.leases'))).toEqual([]);
+      expect(existsSync(lock)).toBe(false);
+    },
+  );
 
   testSignals.each([
     { signal: 'SIGINT' as const, code: 130 },

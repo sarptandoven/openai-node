@@ -44,6 +44,11 @@ if [ "$1" == "--daemon" ]; then
   }
   trap cleanup_steady EXIT
 
+  # Record the server before waiting for it, so a caller can stop it even if startup is interrupted.
+  if [ -n "${OPENAI_MOCK_PID_FILE:-}" ]; then
+    echo "$steady_pid" > "$OPENAI_MOCK_PID_FILE"
+  fi
+
   # Wait for server to come online via health endpoint (max 30s)
   echo -n "Waiting for server"
   attempts=0
@@ -63,6 +68,12 @@ if [ "$1" == "--daemon" ]; then
     echo -n "."
     sleep 0.1
   done
+
+  # Git Bash numbers processes separately from Windows. Record the server's Windows PID too, while
+  # this launcher can still map it, so a caller can stop the server's native process tree.
+  if [ -n "${OPENAI_MOCK_PID_FILE:-}" ] && [ -r "/proc/$steady_pid/winpid" ]; then
+    cat "/proc/$steady_pid/winpid" >> "$OPENAI_MOCK_PID_FILE" 2>/dev/null || true
+  fi
 
   trap - EXIT
   echo
