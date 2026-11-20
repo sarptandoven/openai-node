@@ -429,6 +429,12 @@ function validateOutputItemIdentity(
 
   const expectedType = getExpectedOutputItemType(itemEvent);
   if (output.type !== expectedType) {
+    // The API can emit a citation for a non-message item, such as a function call that follows a
+    // hosted web search. Only message text holds annotations, so the event leaves the snapshot
+    // unchanged after its item identity has been validated.
+    if (event.type === 'response.output_text.annotation.added') {
+      return;
+    }
     throw new OpenAIError(`expected output item type '${expectedType}', got '${output.type}'`);
   }
 }
