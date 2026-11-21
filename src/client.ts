@@ -291,6 +291,12 @@ import {
 } from './internal/provider';
 import { FinalRequestOptions, RequestOptions } from './internal/request-options';
 import {
+  compressRequestBody,
+  compressedRequestBodySummary,
+  validateRequestCompression,
+  type RequestCompression,
+} from './internal/request-compression';
+import {
   finalizeStreamingFormRequestOptions,
   hasUploadableValue,
   maybeMultipartFormRequestOptions,
@@ -422,6 +428,22 @@ export interface ClientOptions {
    * If not provided, we expect that `fetch` is defined globally.
    */
   fetch?: Fetch | undefined;
+
+  /**
+   * Compress the JSON bodies of `POST /responses` requests with zstd and send them with
+   * `Content-Encoding: zstd`, which the OpenAI API accepts for that endpoint. Other
+   * endpoints are unaffected. Off by default; enable it only for an endpoint that accepts
+   * zstd bodies, since providers, proxies and gateways may not.
+   *
+   * A body is sent uncompressed when compression would not make it smaller, or when it
+   * would decompress to more than 100 times its compressed size, which the API rejects.
+   * Set `requestCompression: null` in request options to send one request uncompressed.
+   * `prepareRequest` hooks and providers receive the compressed body; a hook that replaces
+   * the body must also remove `Content-Encoding`.
+   *
+   * Requires a runtime whose `node:zlib` supports zstd, such as Node.js 22.15.0 or later.
+   */
+  requestCompression?: RequestCompression | null | undefined;
 
   /**
    * The maximum number of times that the client will retry a request in case of a
@@ -656,6 +678,7 @@ export class OpenAI {
     this.maxRetries = this.#normalizeRetries(options.maxRetries);
     this.fetch = options.fetch ?? Shims.getDefaultFetch();
     this.#encoder = Opts.FallbackEncoder;
+    validateRequestCompression(options.requestCompression, 'ClientOptions.requestCompression');
 
     const customHeadersEnv = provider || credential ? undefined : readEnv('OPENAI_CUSTOM_HEADERS');
     if (customHeadersEnv) {
@@ -1766,7 +1789,10 @@ export class OpenAI {
 
     if (this.logLevel === 'debug') {
       // Summarize serialized strings without reparsing or re-running caller serialization hooks.
-      const body = typeof req.body === 'string' ? { type: 'string', length: req.body.length } : req.body;
+      const body =
+        typeof req.body === 'string'
+          ? { type: 'string', length: req.body.length }
+          : (compressedRequestBodySummary(req.body) ?? req.body);
       loggerFor(this).debug(
         `[${requestLogID}] sending request`,
         formatRequestDetails({
@@ -2434,13 +2460,26 @@ export class OpenAI {
     if (finalizedContentType === null) reqHeaders.delete('content-type');
     else if (finalizedContentType !== undefined) reqHeaders.set('content-type', finalizedContentType);
 
+    // Compress after the final headers exist, and before hooks, providers and X.509 see the body.
+    const sentBody = await compressRequestBody({
+      compression:
+        options.requestCompression === undefined
+          ? this._options.requestCompression
+          : options.requestCompression,
+      method,
+      path,
+      headers: reqHeaders,
+      body,
+      signal: options.signal,
+    });
+
     const req: FinalizedRequestInit = {
       method,
       headers: reqHeaders,
       ...(options.signal && { signal: options.signal }),
       ...((globalThis as any).ReadableStream &&
         body instanceof (globalThis as any).ReadableStream && { duplex: 'half' }),
-      ...(body && { body }),
+      ...(sentBody && { body: sentBody }),
       ...(((x509Authentication ? x509ClientFetchOptions : this.fetchOptions) as any) ?? {}),
       ...(((x509Authentication ? x509RequestFetchOptions : options.fetchOptions) as any) ?? {}),
     };

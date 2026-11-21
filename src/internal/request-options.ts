@@ -3,6 +3,7 @@ import { NullableHeaders } from './headers';
 import type { BodyInit } from './builtin-types';
 import { Stream } from '../core/streaming';
 import type { HTTPMethod, MergedRequestInit } from './types';
+import type { RequestCompression } from './request-compression';
 import { type HeadersLike } from './headers';
 
 export type FinalRequestOptions = RequestOptions & { method: HTTPMethod; path: string };
@@ -73,6 +74,12 @@ export type RequestOptions = {
    * Override the default base URL for this specific request.
    */
   defaultBaseURL?: string | undefined;
+
+  /**
+   * Overrides the client's `requestCompression` option for this request. `'zstd'`
+   * compresses a `POST /responses` JSON body, and `null` sends it uncompressed.
+   */
+  requestCompression?: RequestCompression | null | undefined;
 
   __metadata?: Record<string, unknown>;
   __security?: { bearerAuth?: boolean; adminAPIKeyAuth?: boolean };

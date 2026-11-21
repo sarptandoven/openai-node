@@ -731,6 +731,35 @@ To access undocumented response properties, you may access the response object w
 the response object, or cast the response object to the requisite type. Like the request params, we do not
 validate or strip extra properties from the response from the API.
 
+### Request compression
+
+The Responses API accepts [zstd-compressed request bodies](https://developers.openai.com/api/docs/guides/production-best-practices#compress-request-bodies),
+which shrink uploads such as long conversations with tool output. Set `requestCompression: 'zstd'`
+to compress the JSON body of every `POST /responses` request, including those from `responses.stream()`,
+`responses.parse()` and `beta.responses.create()`. Requests to other endpoints are not compressed.
+
+<!-- prettier-ignore -->
+```ts
+// Configure the default for all requests:
+const client = new OpenAI({
+  requestCompression: 'zstd', // off by default
+});
+
+// Or, configure per-request (`null` sends one request uncompressed):
+await client.responses.create({ model: 'gpt-5.5', input: 'Summarize this conversation.' }, {
+  requestCompression: 'zstd',
+});
+```
+
+The SDK compresses at zstd level 3 and sends `Content-Encoding: zstd` with `Content-Type: application/json`.
+It sends a body uncompressed when compression would not make it smaller, or when the body would decompress
+to more than 100 times its compressed size, which the API rejects. Compression reduces the bytes sent, not
+token usage or context limits.
+
+This requires a runtime whose `node:zlib` supports zstd, such as Node.js 22.15.0 or later, Bun or Deno.
+In other runtimes, setting the option throws an error. Only enable it for an endpoint that accepts zstd
+request bodies; other providers, proxies and gateways may not.
+
 ### Customizing the fetch client
 
 If you want to use a different `fetch` function, you can either polyfill the global:
